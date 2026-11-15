@@ -17,3 +17,5 @@ body {
   font-family: system-ui, -apple-system, sans-serif;
   direction: rtl;
 }
+
+.card { @apply bg-panel border border-line rounded-2xl p-4; }

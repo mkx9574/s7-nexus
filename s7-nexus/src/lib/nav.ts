@@ -1,6 +1,7 @@
 // phase = المرحلة التي ستُبنى فيها الصفحة فعلياً
 export const PAGES = [
   { id: 'command', label: 'مركز القيادة', phase: 1 },
+  { id: 'vault', label: 'خزنة المعرفة', phase: 3 },
   { id: 'subjects', label: 'المواد السبع', phase: 3 },
   { id: 'syllabus', label: 'خريطة المنهج', phase: 3 },
   { id: 'twin', label: 'التوأم المعرفي', phase: 3 },
