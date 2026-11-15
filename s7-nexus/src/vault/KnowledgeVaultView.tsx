@@ -19,6 +19,7 @@ export const KnowledgeVaultView: React.FC = () => {
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = ''; // للسماح باختيار نفس الملف مرة ثانية
 
     setUploading(true);
     try {
@@ -28,8 +29,9 @@ export const KnowledgeVaultView: React.FC = () => {
       await loadBooks();
     } catch (err) {
       console.error('Error processing PDF:', err);
-      alert('حدث خطأ أثناء معالجة ملف الـ PDF');
+      alert(err instanceof Error ? err.message : 'حدث خطأ أثناء معالجة ملف الـ PDF');
     } finally {
+      await loadBooks();
       setUploading(false);
       setProgress({ current: 0, total: 0 });
     }
@@ -59,7 +61,13 @@ export const KnowledgeVaultView: React.FC = () => {
                   <h4 className="font-bold text-[#e2fee2]">{book.title}</h4>
                   <span className="text-xs text-[#8fa88f]">الحجم: {(book.fileSize / (1024 * 1024)).toFixed(2)} MB</span>
                 </div>
-                <span className="text-xs px-2 py-1 rounded bg-[#00ff66]/10 text-[#00ff66] border border-[#00ff66]/30">مفهرس محلياً</span>
+                {book.status === 'processing' ? (
+                  <span className="text-xs px-2 py-1 rounded bg-[#ffb000]/10 text-[#ffb000] border border-[#ffb000]/30">
+                    غير مكتمل ({book.lastProcessedPage ?? 0}/{book.totalPages ?? '؟'}) — اختر نفس الملف للاستئناف
+                  </span>
+                ) : (
+                  <span className="text-xs px-2 py-1 rounded bg-[#00ff66]/10 text-[#00ff66] border border-[#00ff66]/30">مفهرس محلياً</span>
+                )}
               </div>
             ))}
           </div>

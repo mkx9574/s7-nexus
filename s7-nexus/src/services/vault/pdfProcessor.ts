@@ -1,26 +1,25 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import { evaluatePageQuality } from '../../engines/vault/pageQuality';
 import { createChunks } from '../../engines/vault/chunk';
-import { vaultDb, PageRecord, ChunkRecord } from '../../vault/io/db';
+import { vaultDb, BookRecord, PageRecord, ChunkRecord } from '../../vault/io/db';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
 
-const CHECKPOINT_KEY = 's7_nexus_pdf_resume_checkpoint';
+// نحفظ التقدم في القاعدة كل هذا العدد من الصفحات (دفعة واحدة ذرّية)
+const BATCH_PAGES = 10;
 
-interface CheckpointState {
-  bookId: string;
-  lastProcessedPage: number;
-  totalPages: number;
-}
-
-export function getSavedCheckpoint(): CheckpointState | null {
-  const raw = localStorage.getItem(CHECKPOINT_KEY);
-  if (!raw) return null;
+async function computeFileHash(buffer: ArrayBuffer, file: File): Promise<string> {
   try {
-    return JSON.parse(raw);
+    if (globalThis.crypto && globalThis.crypto.subtle) {
+      const digest = await globalThis.crypto.subtle.digest('SHA-256', buffer);
+      return Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
   } catch {
-    return null;
+    // نكمل بالبديل أدناه
   }
+  return `size-${file.size}-${file.name}`;
 }
 
 export async function processAndStorePdf(
@@ -29,25 +28,62 @@ export async function processAndStorePdf(
   title: string,
   onProgress?: (current: number, total: number) => void
 ): Promise<string> {
-  const arrayBuffer = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const buffer = await file.arrayBuffer();
+
+  // الترتيب مهم: البصمة والنسخة الأصلية قبل getDocument، لأن PDF.js قد يستهلك المخزن المؤقت
+  const fileHash = await computeFileHash(buffer, file);
+  const existing = await vaultDb.books.where('fileHash').equals(fileHash).first();
+
+  if (existing && existing.status !== 'processing') {
+    throw new Error('هذا الكتاب مفهرس مسبقاً في الخزنة، فلن يُرفع مرة ثانية.');
+  }
+
+  const pdfBlob = new Blob([buffer], { type: 'application/pdf' });
+  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
   const totalPages = pdf.numPages;
 
-  let checkpoint = getSavedCheckpoint();
   let bookId: string;
   let startPage = 1;
+  let ordinal = 0;
 
-  const pageRecords: PageRecord[] = [];
-  const chunkRecords: ChunkRecord[] = [];
-  let globalOrdinal = 1;
-
-  if (checkpoint && checkpoint.totalPages === totalPages) {
-    bookId = checkpoint.bookId;
-    startPage = checkpoint.lastProcessedPage + 1;
-    // استرجاع المقاطع والصفحات الموجودة مسبقاً إذا لزم
+  if (existing) {
+    // استئناف كتاب لم تكتمل معالجته: نكمل من آخر دفعة حُفظت فعلاً
+    bookId = existing.id;
+    startPage = (existing.lastProcessedPage ?? 0) + 1;
+    ordinal = await vaultDb.chunks.where('bookId').equals(bookId).count();
+    await vaultDb.files.put({ id: bookId, blob: pdfBlob });
   } else {
     bookId = `book_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const book: BookRecord = {
+      id: bookId,
+      title: title || file.name.replace(/\.pdf$/i, ''),
+      subjectId,
+      fileName: file.name,
+      fileSize: file.size,
+      uploadedAt: Date.now(),
+      status: 'processing',
+      lastProcessedPage: 0,
+      totalPages,
+      fileHash,
+    };
+    await vaultDb.transaction('rw', vaultDb.books, vaultDb.files, async () => {
+      await vaultDb.books.add(book);
+      await vaultDb.files.put({ id: bookId, blob: pdfBlob });
+    });
   }
+
+  let pendingPages: PageRecord[] = [];
+  let pendingChunks: ChunkRecord[] = [];
+
+  const flush = async (lastPage: number) => {
+    await vaultDb.transaction('rw', vaultDb.books, vaultDb.pages, vaultDb.chunks, async () => {
+      if (pendingPages.length > 0) await vaultDb.pages.bulkPut(pendingPages);
+      if (pendingChunks.length > 0) await vaultDb.chunks.bulkPut(pendingChunks);
+      await vaultDb.books.update(bookId, { lastProcessedPage: lastPage });
+    });
+    pendingPages = [];
+    pendingChunks = [];
+  };
 
   for (let pageNum = startPage; pageNum <= totalPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
@@ -56,10 +92,11 @@ export async function processAndStorePdf(
       .map((item: any) => item.str)
       .join(' ')
       .trim();
+    page.cleanup();
 
     const quality = evaluatePageQuality(rawText);
 
-    pageRecords.push({
+    pendingPages.push({
       id: `${bookId}_p${pageNum}`,
       bookId,
       pageNumber: pageNum,
@@ -77,10 +114,11 @@ export async function processAndStorePdf(
       });
 
       for (const ch of pageChunks) {
-        chunkRecords.push({
-          id: `${bookId}_c${globalOrdinal++}`,
+        ordinal += 1;
+        pendingChunks.push({
+          id: `${bookId}_c${ordinal}`,
           bookId,
-          ordinal: globalOrdinal,
+          ordinal,
           text: ch.text,
           pdfPageStart: ch.pdfPageStart,
           pdfPageEnd: ch.pdfPageEnd,
@@ -88,34 +126,13 @@ export async function processAndStorePdf(
       }
     }
 
-    // حفظ تقدم كل صفحة في الـ Checkpoint وفي قاعدة البيانات تدريجياً
-    localStorage.setItem(
-      CHECKPOINT_KEY,
-      JSON.stringify({ bookId, lastProcessedPage: pageNum, totalPages })
-    );
-
-    if (onProgress) {
-      onProgress(pageNum, totalPages);
+    if (pageNum % BATCH_PAGES === 0 || pageNum === totalPages) {
+      await flush(pageNum);
     }
+
+    if (onProgress) onProgress(pageNum, totalPages);
   }
 
-  await vaultDb.transaction('rw', vaultDb.books, vaultDb.pages, vaultDb.chunks, async () => {
-    if (startPage === 1) {
-      await vaultDb.books.add({
-        id: bookId,
-        title: title || file.name.replace(/\.pdf$/i, ''),
-        subjectId,
-        fileName: file.name,
-        fileSize: file.size,
-        uploadedAt: Date.now(),
-      });
-    }
-    if (pageRecords.length > 0) await vaultDb.pages.bulkPut(pageRecords);
-    if (chunkRecords.length > 0) await vaultDb.chunks.bulkPut(chunkRecords);
-  });
-
-  // تنظيف نقطة الاختيار بعد الاكتمال الناجح
-  localStorage.removeItem(CHECKPOINT_KEY);
-
+  await vaultDb.books.update(bookId, { status: 'complete', lastProcessedPage: totalPages });
   return bookId;
 }
