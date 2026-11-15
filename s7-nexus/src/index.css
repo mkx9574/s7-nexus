@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-bg: #050a05;
+  --color-surface: #0a140a;
+  --color-primary: #00ff66;
+  --color-primary-dark: #00cc52;
+  --color-text: #e2fee2;
+  --color-muted: #8fa88f;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-family: system-ui, -apple-system, sans-serif;
+  direction: rtl;
+}
